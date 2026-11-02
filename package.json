@@ -1,0 +1,7 @@
+{
+  "name": "vault-rust",
+  "version": "0.1.0",
+  "description": "High-performance, pure native Markdown viewer and personal knowledge base built with Rust and egui",
+  "license": "MIT",
+  "private": true
+}
