@@ -163,7 +163,22 @@ pub fn configure_theme(ctx: &egui::Context) {
     style.visuals = visuals;
     style.spacing.item_spacing = egui::vec2(6.0, 4.0);
     style.spacing.button_padding = egui::vec2(10.0, 4.0);
-    style.spacing.scroll = egui::style::ScrollStyle::thin();
+    style.spacing.scroll = egui::style::ScrollStyle {
+        floating: true,
+        bar_width: 8.0,
+        floating_width: 6.0,
+        floating_allocated_width: 0.0,
+        foreground_color: true,
+        dormant_background_opacity: 0.0,
+        active_background_opacity: 0.0,
+        interact_background_opacity: 0.15,
+        dormant_handle_opacity: 0.35,
+        active_handle_opacity: 0.65,
+        interact_handle_opacity: 0.95,
+        bar_inner_margin: 2.0,
+        bar_outer_margin: 2.0,
+        handle_min_length: 24.0,
+    };
     style.interaction.selectable_labels = false;
 
     ctx.set_style(style);
