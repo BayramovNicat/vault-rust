@@ -5,7 +5,7 @@ use egui::{
     Align, Align2, Color32, FontId, Layout, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, TextFormat, Vec2,
 };
 
-use crate::markdown::{click_action, live_layouter, paint_overlay, Env, PreviewAction, SvgByContentLoader};
+use crate::markdown::{click_action, doc_for, live_layouter, paint_overlay, toggle_details, Env, PreviewAction, SvgByContentLoader};
 use crate::theme::colors;
 use crate::vault::{MarkdownFile, VaultStore};
 use crate::wiki_links::Backlink;
@@ -30,6 +30,21 @@ pub struct VaultApp {
     pub sidebar_collapsed: bool,
     pub search_query: String,
     pub is_source_mode: bool,
+    pub outline_open: bool,
+
+    // Navigation history
+    nav_back: Vec<String>,
+    nav_forward: Vec<String>,
+
+    // Quick Switcher (Cmd+P / Cmd+K)
+    quick_open: bool,
+    quick_query: String,
+    quick_index: usize,
+    quick_focus: bool,
+
+    // Wiki-link autocomplete
+    ac_index: usize,
+    ac_dismissed_at: Option<usize>,
 
     // Find in note
     pub find_open: bool,
@@ -78,6 +93,15 @@ impl VaultApp {
             sidebar_collapsed: false,
             search_query: String::new(),
             is_source_mode: false,
+            outline_open: false,
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
+            quick_open: false,
+            quick_query: String::new(),
+            quick_index: 0,
+            quick_focus: false,
+            ac_index: 0,
+            ac_dismissed_at: None,
             find_open: false,
             find_query: String::new(),
             find_matches: Vec::new(),
@@ -95,9 +119,12 @@ impl VaultApp {
             cached_backlinks: Vec::new(),
         };
 
-        if let Some(first) = app.store.files.first() {
+        let restored = app.load_session();
+        if let Some(path) = restored.filter(|p| app.store.file(p).is_some()) {
+            app.load_note_with_history(&path, false);
+        } else if let Some(first) = app.store.files.first() {
             let path = first.relative_path.clone();
-            app.load_note(&path);
+            app.load_note_with_history(&path, false);
         }
 
         app
@@ -108,21 +135,87 @@ impl VaultApp {
     }
 
     pub fn load_note(&mut self, path: &str) {
+        self.load_note_with_history(path, true);
+    }
+
+    pub fn load_note_with_history(&mut self, path: &str, record_history: bool) {
+        if self.selected_path.as_deref() == Some(path) {
+            return;
+        }
         if self.is_dirty {
             self.save_current();
         }
 
         match self.store.read_file(path) {
             Ok(content) => {
+                if record_history {
+                    if let Some(prev) = self.selected_path.take() {
+                        self.nav_back.push(prev);
+                        if self.nav_back.len() > 64 {
+                            self.nav_back.remove(0);
+                        }
+                        self.nav_forward.clear();
+                    }
+                }
                 self.selected_path = Some(path.to_string());
                 self.content = content;
                 self.is_dirty = false;
                 self.loaded_mtime = self.store.file(path).map(|f| f.mtime);
+                self.ac_dismissed_at = None;
                 self.refresh_backlinks();
                 self.update_find_matches();
             }
             Err(e) => self.show_error(format!("Couldn't open {path}: {e}")),
         }
+    }
+
+    fn go_back(&mut self) {
+        while let Some(prev) = self.nav_back.pop() {
+            if self.store.file(&prev).is_some() {
+                if let Some(cur) = self.selected_path.clone() {
+                    self.nav_forward.push(cur);
+                }
+                self.load_note_with_history(&prev, false);
+                return;
+            }
+        }
+    }
+
+    fn go_forward(&mut self) {
+        while let Some(next) = self.nav_forward.pop() {
+            if self.store.file(&next).is_some() {
+                if let Some(cur) = self.selected_path.clone() {
+                    self.nav_back.push(cur);
+                }
+                self.load_note_with_history(&next, false);
+                return;
+            }
+        }
+    }
+
+    fn session_path(&self) -> std::path::PathBuf {
+        self.store.root.join(".vault_state")
+    }
+
+    fn load_session(&mut self) -> Option<String> {
+        let raw = std::fs::read_to_string(self.session_path()).ok()?;
+        let mut last_note = None;
+        for line in raw.lines() {
+            if let Some(val) = line.strip_prefix("last_note=") {
+                if !val.is_empty() {
+                    last_note = Some(val.to_string());
+                }
+            } else if let Some(val) = line.strip_prefix("sidebar_collapsed=") {
+                self.sidebar_collapsed = val == "true";
+            }
+        }
+        last_note
+    }
+
+    fn save_session(&self) {
+        let note = self.selected_path.as_deref().unwrap_or("");
+        let data = format!("last_note={note}\nsidebar_collapsed={}\n", self.sidebar_collapsed);
+        let _ = std::fs::write(self.session_path(), data);
     }
 
     pub fn save_current(&mut self) {
@@ -154,20 +247,7 @@ impl VaultApp {
             return;
         }
 
-        let query_lower = self.find_query.to_lowercase();
-        let content_lower = self.content.to_lowercase();
-        // Lowercasing can change byte lengths for some scripts; only use matches when lengths agree.
-        if content_lower.len() != self.content.len() {
-            return;
-        }
-
-        let mut start = 0;
-        let qlen = query_lower.len();
-        while let Some(pos) = content_lower[start..].find(&query_lower) {
-            let abs_pos = start + pos;
-            self.find_matches.push((abs_pos, abs_pos + qlen));
-            start = abs_pos + qlen.max(1);
-        }
+        self.find_matches = find_case_insensitive(&self.content, &self.find_query);
         self.find_match_chars = byte_ranges_to_chars(&self.content, &self.find_matches);
 
         if self.find_match_index >= self.find_matches.len() {
@@ -204,13 +284,38 @@ impl VaultApp {
         self.show_rename_dialog = true;
     }
 
+    fn active_editor_id(&self, ctx: &egui::Context) -> Option<egui::Id> {
+        let id = egui::Id::new(if self.is_source_mode { SOURCE_ID } else { PREVIEW_ID });
+        ctx.memory(|m| m.has_focus(id)).then_some(id)
+    }
+
     pub fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let cmd = egui::Modifiers::COMMAND;
+        let cmd_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+        let editor_focused = self.active_editor_id(ctx).is_some();
+
         if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::S)) {
             self.save_current();
         }
         if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::N)) {
             self.open_create_dialog();
+        }
+        if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::P) || (!editor_focused && i.consume_key(cmd, egui::Key::K))) {
+            self.quick_open = !self.quick_open;
+            if self.quick_open {
+                self.quick_query.clear();
+                self.quick_index = 0;
+                self.quick_focus = true;
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(cmd_shift, egui::Key::O)) {
+            self.outline_open = !self.outline_open;
+        }
+        if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::OpenBracket)) {
+            self.go_back();
+        }
+        if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::CloseBracket)) {
+            self.go_forward();
         }
         if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::F)) {
             self.find_open = !self.find_open;
@@ -220,15 +325,46 @@ impl VaultApp {
         if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::E)) {
             self.is_source_mode = !self.is_source_mode;
         }
-        if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::B) || i.consume_key(cmd, egui::Key::Backslash)) {
+        if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::Backslash) || i.consume_key(cmd_shift, egui::Key::B) || (!editor_focused && i.consume_key(cmd, egui::Key::B))) {
             self.sidebar_collapsed = !self.sidebar_collapsed;
+            self.save_session();
+        }
+        if let Some(ed_id) = self.active_editor_id(ctx) {
+            if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::B)) {
+                self.wrap_selection(ctx, ed_id, "**", "**");
+            }
+            if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::I)) {
+                self.wrap_selection(ctx, ed_id, "*", "*");
+            }
+            if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::K)) {
+                self.wrap_selection(ctx, ed_id, "[", "](url)");
+            }
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.find_open = false;
+            self.quick_open = false;
+            self.outline_open = false;
             self.show_create_dialog = false;
             self.show_rename_dialog = false;
             self.show_delete_dialog = false;
         }
+    }
+
+    fn wrap_selection(&mut self, ctx: &egui::Context, id: egui::Id, prefix: &str, suffix: &str) {
+        let Some(mut state) = egui::TextEdit::load_state(ctx, id) else { return };
+        let Some(range) = state.cursor.char_range() else { return };
+        let (a, b) = char_range_to_bytes(&self.content, range.primary.index, range.secondary.index);
+        let selected = self.content[a..b].to_string();
+        let replacement = format!("{prefix}{selected}{suffix}");
+        self.content.replace_range(a..b, &replacement);
+        self.mark_edited();
+        let new_start = self.content[..a].chars().count() + prefix.chars().count();
+        let new_end = new_start + selected.chars().count();
+        let c1 = egui::text::CCursor::new(new_start);
+        let c2 = egui::text::CCursor::new(new_end);
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(c1, c2)));
+        state.store(ctx, id);
+        ctx.request_repaint();
     }
 
     pub fn poll_watcher(&mut self) {
@@ -275,13 +411,66 @@ impl VaultApp {
     }
 
     fn open_link_target(&mut self, target: &str) {
-        if let Some(resolved_path) = self.store.resolver().resolve(target) {
-            self.load_note(&resolved_path);
-        } else {
-            let new_filename = VaultStore::normalize_filename(target);
-            match self.store.create_file(&new_filename, &format!("# {target}\n\n")) {
-                Ok(path) => self.load_note(&path),
-                Err(e) => self.show_error(format!("Couldn't create {new_filename}: {e}")),
+        let (note_part, heading_part) = match target.split_once('#') {
+            Some((n, h)) => (n.trim(), Some(h.trim())),
+            None => (target.trim(), None),
+        };
+        if !note_part.is_empty() {
+            if let Some(resolved_path) = self.store.resolver().resolve(note_part) {
+                self.load_note(&resolved_path);
+            } else {
+                let new_filename = VaultStore::normalize_filename(note_part);
+                match self.store.create_file(&new_filename, &format!("# {note_part}\n\n")) {
+                    Ok(path) => self.load_note(&path),
+                    Err(e) => {
+                        self.show_error(format!("Couldn't create {new_filename}: {e}"));
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(anchor) = heading_part.filter(|h| !h.is_empty()) {
+            let slug = crate::markdown::doc_for(&self.content)
+                .headings
+                .iter()
+                .find(|(_, _, s)| s == &slugify_anchor(anchor))
+                .map(|(at, _, _)| *at);
+            if let Some(byte) = slug {
+                self.pending_select = Some((byte, byte));
+            }
+        }
+    }
+
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        for f in dropped {
+            let Some(path) = f.path else { continue };
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            if ext == "md" {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("imported.md");
+                    match self.store.create_file(name, &text) {
+                        Ok(rel) => self.load_note(&rel),
+                        Err(e) => self.show_error(format!("Couldn't import {name}: {e}")),
+                    }
+                }
+            } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg") {
+                if self.selected_path.is_some() {
+                    match self.store.import_asset(&path) {
+                        Ok(rel) => {
+                            let alt = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+                            if !self.content.is_empty() && !self.content.ends_with('\n') {
+                                self.content.push('\n');
+                            }
+                            self.content.push_str(&format!("![{alt}]({rel})\n"));
+                            self.mark_edited();
+                        }
+                        Err(e) => self.show_error(format!("Couldn't import image: {e}")),
+                    }
+                }
             }
         }
     }
@@ -306,6 +495,7 @@ impl eframe::App for VaultApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_watcher();
+        self.handle_dropped_files(ctx);
         self.handle_shortcuts(ctx);
 
         // Autosave shortly after typing stops.
@@ -321,8 +511,16 @@ impl eframe::App for VaultApp {
         }
         self.note_area(ctx);
         self.floating_controls(ctx);
+        self.quick_switcher(ctx);
         self.error_toast(ctx);
         self.render_dialogs(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.is_dirty {
+            self.save_current();
+        }
+        self.save_session();
     }
 }
 
@@ -340,7 +538,7 @@ impl VaultApp {
                 egui::Frame::new()
                     .fill(if self.glass { colors::GLASS_SIDEBAR } else { colors::BG_SIDEBAR })
                     .inner_margin(egui::Margin { left: 10, right: 10, top: 0, bottom: 10 })
-                    .stroke(Stroke::new(1.0, Color32::from_white_alpha(8))),
+                    .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(8))),
             )
             .show(ctx, |ui| {
                 // Title strip (traffic lights live here) doubles as a window drag handle.
@@ -389,7 +587,7 @@ impl VaultApp {
                 ui.add_space(8.0);
 
                 // File list
-                let query = self.search_query.to_lowercase();
+                let query = self.search_query.trim().to_lowercase();
 
                 let mut to_open = None;
                 let mut to_rename = None;
@@ -398,10 +596,29 @@ impl VaultApp {
                 ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     let mut shown = 0;
-                    for file in self.store.files.iter().filter(|f| query.is_empty() || f.search_key.contains(&query)) {
+                    for file in self.store.files.iter().filter(|f| {
+                        if query.is_empty() {
+                            return true;
+                        }
+                        if f.search_key.contains(&query) {
+                            return true;
+                        }
+                        if let Some(meta) = self.store.meta_index.get(&f.relative_path) {
+                            let tag_q = query.strip_prefix('#').unwrap_or(&query);
+                            return meta.tags.iter().any(|t| t.contains(tag_q)) || meta.content_lower.contains(&query);
+                        }
+                        false
+                    }) {
                         shown += 1;
                         let selected = self.selected_path.as_deref() == Some(file.relative_path.as_str());
-                        let resp = file_row(ui, file, selected);
+                        let content_match = !query.is_empty()
+                            && !file.search_key.contains(&query)
+                            && self
+                                .store
+                                .meta_index
+                                .get(&file.relative_path)
+                                .is_some_and(|m| m.content_lower.contains(&query));
+                        let resp = file_row(ui, file, selected, content_match);
                         if resp.clicked() {
                             to_open = Some(file.relative_path.clone());
                         }
@@ -519,9 +736,21 @@ impl VaultApp {
             if scrolled {
                 ui.painter().line_segment(
                     [Pos2::new(full.left(), strip.bottom()), Pos2::new(full.right(), strip.bottom())],
-                    Stroke::new(1.0, Color32::from_white_alpha(10)),
+                    Stroke::new(1.0_f32, Color32::from_white_alpha(10)),
                 );
             }
+
+            // Quiet word count & reading time in the bottom-right corner.
+            let words = self.content.split_whitespace().count();
+            let mins = (words / 200).max(1);
+            let stats = if words == 1 { "1 word".to_string() } else { format!("{words} words · {mins} min") };
+            ui.painter().text(
+                Pos2::new(full.right() - 16.0, full.bottom() - 12.0),
+                Align2::RIGHT_BOTTOM,
+                stats,
+                FontId::proportional(11.0),
+                colors::TEXT_MUTED,
+            );
 
             if let Some(target) = link_to_open {
                 self.open_link_target(&target);
@@ -565,14 +794,21 @@ impl VaultApp {
             } else {
                 Color32::from_rgba_unmultiplied(235, 175, 40, 55)
             };
-            let rects = if (a.top() - b.top()).abs() < 0.5 {
+            let rects: Vec<Rect> = if (a.top() - b.top()).abs() < 0.5 {
                 vec![Rect::from_min_max(a.left_top(), Pos2::new(b.left(), a.bottom()))]
             } else {
-                let right = g.rect.right() + off.x;
-                vec![
-                    Rect::from_min_max(a.left_top(), Pos2::new(right, a.bottom())),
-                    Rect::from_min_max(Pos2::new(output.galley_pos.x, b.top()), b.left_bottom()),
-                ]
+                g.rows
+                    .iter()
+                    .filter_map(|row| {
+                        let rr = row.rect().translate(off);
+                        if rr.bottom() < a.top() + 0.5 || rr.top() > b.bottom() - 0.5 {
+                            return None;
+                        }
+                        let x0 = if (rr.top() - a.top()).abs() < 0.5 { a.left() } else { rr.left() };
+                        let x1 = if (rr.top() - b.top()).abs() < 0.5 { b.left() } else { rr.right() };
+                        Some(Rect::from_min_max(Pos2::new(x0, rr.top()), Pos2::new(x1, rr.bottom())))
+                    })
+                    .collect()
             };
             for r in rects {
                 if r.width() > 0.5 {
@@ -585,6 +821,7 @@ impl VaultApp {
 
     fn source_editor(&mut self, ui: &mut egui::Ui, min_h: f32) {
         let id = egui::Id::new(SOURCE_ID);
+        let prev_len = self.content.len();
         let hl_slot = ui.painter().add(egui::Shape::Noop);
         let output = egui::TextEdit::multiline(&mut self.content)
             .id(id)
@@ -597,7 +834,9 @@ impl VaultApp {
             .show(ui);
         if output.response.changed() {
             self.mark_edited();
+            self.smart_enter_continuation(ui.ctx(), id, &output, prev_len);
         }
+        self.wiki_autocomplete(ui.ctx(), id, &output);
         self.paint_find_highlights(ui, &output, hl_slot);
         self.apply_pending_select(ui, id, &output);
     }
@@ -621,6 +860,7 @@ impl VaultApp {
         };
 
         // Reserved now, filled after the editor is drawn, so backgrounds sit under the text.
+        let prev_len = self.content.len();
         let bg_slot = ui.painter().add(egui::Shape::Noop);
         let hl_slot = ui.painter().add(egui::Shape::Noop);
         let output = egui::TextEdit::multiline(&mut self.content)
@@ -634,7 +874,9 @@ impl VaultApp {
 
         if output.response.changed() {
             self.mark_edited();
+            self.smart_enter_continuation(ui.ctx(), edit_id, &output, prev_len);
         }
+        self.wiki_autocomplete(ui.ctx(), edit_id, &output);
 
         // Cursor moved in/out of a rich block: lay out again right away.
         let new_reveal = if output.response.has_focus() {
@@ -672,6 +914,10 @@ impl VaultApp {
             Some(PreviewAction::OpenNote(target)) => return Some(target),
             Some(PreviewAction::OpenUrl(url)) => open_url(ui.ctx(), &url),
             Some(PreviewAction::ToggleTask(range)) => self.toggle_task(range),
+            Some(PreviewAction::ToggleDetails(start)) => {
+                toggle_details(ui.ctx(), start);
+                ui.ctx().request_repaint();
+            }
             Some(PreviewAction::Replace(range, new_text)) => {
                 if range.end <= self.content.len() && self.content.is_char_boundary(range.start) && self.content.is_char_boundary(range.end) {
                     self.content.replace_range(range, &new_text);
@@ -723,15 +969,25 @@ impl VaultApp {
     // -----------------------------------------------------------------------
 
     fn floating_controls(&mut self, ctx: &egui::Context) {
-        // Sidebar toggle, right of the traffic lights.
+        // Sidebar toggle + Back/Forward history, right of the traffic lights.
         egui::Area::new(egui::Id::new("sidebar_button"))
             .fixed_pos(Pos2::new(80.0, (TITLE_STRIP - 26.0) / 2.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                let tip = if self.sidebar_collapsed { "Show sidebar  ⌘B" } else { "Hide sidebar  ⌘B" };
-                if icon_button_sized(ui, Icon::Sidebar, 26.0).on_hover_text(tip).clicked() {
-                    self.sidebar_collapsed = !self.sidebar_collapsed;
-                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let tip = if self.sidebar_collapsed { "Show sidebar  ⌘\\" } else { "Hide sidebar  ⌘\\" };
+                    if icon_button_sized(ui, Icon::Sidebar, 26.0).on_hover_text(tip).clicked() {
+                        self.sidebar_collapsed = !self.sidebar_collapsed;
+                        self.save_session();
+                    }
+                    if !self.nav_back.is_empty() && icon_button_sized(ui, Icon::Back, 24.0).on_hover_text("Back  ⌘[").clicked() {
+                        self.go_back();
+                    }
+                    if !self.nav_forward.is_empty() && icon_button_sized(ui, Icon::Forward, 24.0).on_hover_text("Forward  ⌘]").clicked() {
+                        self.go_forward();
+                    }
+                });
             });
 
         if self.selected_path.is_none() {
@@ -747,12 +1003,53 @@ impl VaultApp {
                         let (r, _) = ui.allocate_exact_size(Vec2::new(10.0, 24.0), Sense::hover());
                         ui.painter().circle_filled(r.center(), 3.0, colors::TEXT_MUTED);
                     }
+                    if icon_button_sized(ui, Icon::Outline, 24.0).on_hover_text("Outline  ⌘⇧O").clicked() {
+                        self.outline_open = !self.outline_open;
+                    }
                     let (label, tip) = if self.is_source_mode { ("Preview", "Show preview  ⌘E") } else { ("Edit", "Edit Markdown  ⌘E") };
                     if pill(ui, label, self.is_source_mode).on_hover_text(tip).clicked() {
                         self.is_source_mode = !self.is_source_mode;
                     }
                 });
             });
+
+        if self.outline_open {
+            let headings = doc_for(&self.content).headings.clone();
+            egui::Area::new(egui::Id::new("outline_popover"))
+                .anchor(Align2::RIGHT_TOP, Vec2::new(-16.0, TITLE_STRIP + 2.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(colors::BG_CARD)
+                        .stroke(Stroke::new(1.0_f32, colors::BORDER_LIGHT))
+                        .corner_radius(8.0)
+                        .shadow(ctx.style().visuals.popup_shadow)
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(240.0);
+                            ui.label(RichText::new("Outline").size(12.0).color(colors::TEXT_MUTED));
+                            ui.add_space(4.0);
+                            if headings.is_empty() {
+                                ui.label(RichText::new("No headings").size(12.0).color(colors::TEXT_MUTED));
+                            } else {
+                                ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                    for (byte, level, _) in &headings {
+                                        let line_end = self.content[*byte..].find('\n').map_or(self.content.len(), |i| byte + i);
+                                        let title = self.content[*byte..line_end].trim_start_matches('#').trim();
+                                        let indent = (*level as f32 - 1.0).max(0.0) * 10.0;
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(indent);
+                                            if ui.selectable_label(false, RichText::new(title).size(12.5).color(colors::TEXT_PRIMARY)).clicked() {
+                                                self.pending_select = Some((*byte, *byte));
+                                                self.outline_open = false;
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                        });
+                });
+        }
 
         if self.find_open {
             egui::Area::new(egui::Id::new("find_bar"))
@@ -761,7 +1058,7 @@ impl VaultApp {
                 .show(ctx, |ui| {
                     egui::Frame::new()
                         .fill(colors::BG_CARD)
-                        .stroke(Stroke::new(1.0, colors::BORDER_LIGHT))
+                        .stroke(Stroke::new(1.0_f32, colors::BORDER_LIGHT))
                         .corner_radius(8.0)
                         .shadow(ctx.style().visuals.popup_shadow)
                         .inner_margin(egui::Margin::symmetric(10, 6))
@@ -826,13 +1123,280 @@ impl VaultApp {
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(Color32::from_rgb(48, 24, 26))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(90, 40, 44)))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(90, 40, 44)))
                     .corner_radius(8.0)
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         ui.label(RichText::new(msg).size(12.5).color(colors::TEXT_PRIMARY));
                     });
             });
+    }
+
+    /// Smart list, task, and blockquote continuation when pressing Enter.
+    fn smart_enter_continuation(&mut self, ctx: &egui::Context, id: egui::Id, output: &egui::text_edit::TextEditOutput, prev_len: usize) {
+        if self.content.len() != prev_len + 1 {
+            return;
+        }
+        let Some(range) = output.cursor_range else { return };
+        if range.primary.index != range.secondary.index {
+            return;
+        }
+        let cur = char_to_byte(&self.content, range.primary.index);
+        if cur == 0 || self.content.as_bytes().get(cur - 1) != Some(&b'\n') {
+            return;
+        }
+        let prev_end = cur - 1;
+        let prev_start = self.content[..prev_end].rfind('\n').map_or(0, |i| i + 1);
+        let prev_line = &self.content[prev_start..prev_end];
+        let indent_len = prev_line.len() - prev_line.trim_start().len();
+        let (indent, rest) = prev_line.split_at(indent_len);
+
+        let next_prefix: Option<(String, bool)> = if let Some(after) = rest
+            .strip_prefix("- [ ] ")
+            .or_else(|| rest.strip_prefix("- [x] "))
+            .or_else(|| rest.strip_prefix("- [X] "))
+        {
+            Some((format!("{indent}- [ ] "), after.trim().is_empty()))
+        } else if let Some(b) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")).or_else(|| rest.strip_prefix("+ ")) {
+            let marker = &rest[..2];
+            Some((format!("{indent}{marker}"), b.trim().is_empty()))
+        } else if let Some(after) = rest.strip_prefix("> ") {
+            Some((format!("{indent}> "), after.trim().is_empty()))
+        } else {
+            let digits = rest.bytes().take_while(|c| c.is_ascii_digit()).count();
+            if digits > 0 && rest.len() > digits + 1 && matches!(rest.as_bytes()[digits], b'.' | b')') && rest.as_bytes()[digits + 1] == b' ' {
+                let num: usize = rest[..digits].parse().unwrap_or(1);
+                let sep = rest.as_bytes()[digits] as char;
+                let after = &rest[digits + 2..];
+                Some((format!("{indent}{}{sep} ", num + 1), after.trim().is_empty()))
+            } else {
+                None
+            }
+        };
+
+        let Some((prefix, was_empty)) = next_prefix else { return };
+        let mut state = output.state.clone();
+        if was_empty {
+            self.content.replace_range(prev_start..cur, "");
+            self.mark_edited();
+            let c = egui::text::CCursor::new(self.content[..prev_start].chars().count());
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(c)));
+        } else {
+            self.content.insert_str(cur, &prefix);
+            self.mark_edited();
+            let c = egui::text::CCursor::new(self.content[..cur + prefix.len()].chars().count());
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(c)));
+        }
+        state.store(ctx, id);
+        ctx.request_repaint();
+    }
+
+    /// Floating `[[wiki-link]]` autocomplete popup anchored near the cursor.
+    fn wiki_autocomplete(&mut self, ctx: &egui::Context, id: egui::Id, output: &egui::text_edit::TextEditOutput) {
+        if !output.response.has_focus() {
+            return;
+        }
+        let Some(range) = output.cursor_range else { return };
+        if range.primary.index != range.secondary.index {
+            return;
+        }
+        let cur = char_to_byte(&self.content, range.primary.index);
+        let line_start = self.content[..cur].rfind('\n').map_or(0, |i| i + 1);
+        let before = &self.content[line_start..cur];
+        let Some(rel_open) = before.rfind("[[") else {
+            self.ac_dismissed_at = None;
+            return;
+        };
+        if before[rel_open + 2..].contains("]]") {
+            self.ac_dismissed_at = None;
+            return;
+        }
+        let open_byte = line_start + rel_open;
+        if self.ac_dismissed_at == Some(open_byte) {
+            return;
+        }
+        let query = before[rel_open + 2..].trim().to_lowercase();
+        let matches: Vec<String> = self
+            .store
+            .files
+            .iter()
+            .filter(|f| query.is_empty() || f.search_key.contains(&query))
+            .take(8)
+            .map(|f| f.title().to_string())
+            .collect();
+        if matches.is_empty() {
+            return;
+        }
+        if self.ac_index >= matches.len() {
+            self.ac_index = 0;
+        }
+
+        let mut accept: Option<String> = None;
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+            self.ac_index = (self.ac_index + 1) % matches.len();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+            self.ac_index = (self.ac_index + matches.len() - 1) % matches.len();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
+            accept = Some(matches[self.ac_index].clone());
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.ac_dismissed_at = Some(open_byte);
+            return;
+        }
+
+        let cursor_rect = output.galley.pos_from_cursor(range.primary).translate(output.galley_pos.to_vec2());
+        egui::Area::new(egui::Id::new("wiki_autocomplete"))
+            .fixed_pos(Pos2::new(cursor_rect.left(), cursor_rect.bottom() + 4.0))
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(colors::BG_CARD)
+                    .stroke(Stroke::new(1.0_f32, colors::BORDER_LIGHT))
+                    .corner_radius(8.0)
+                    .shadow(ctx.style().visuals.popup_shadow)
+                    .inner_margin(egui::Margin::same(4))
+                    .show(ui, |ui| {
+                        ui.set_width(220.0);
+                        for (idx, title) in matches.iter().enumerate() {
+                            let selected = idx == self.ac_index;
+                            if ui.selectable_label(selected, RichText::new(title).size(12.5).color(colors::TEXT_PRIMARY)).clicked() {
+                                accept = Some(title.clone());
+                            }
+                        }
+                    });
+            });
+
+        if let Some(title) = accept {
+            let replace_start = open_byte + 2;
+            let already_closed = self.content[cur..].starts_with("]]");
+            let inserted = if already_closed { title.clone() } else { format!("{title}]]") };
+            self.content.replace_range(replace_start..cur, &inserted);
+            self.mark_edited();
+            let end_byte = replace_start + title.len() + 2;
+            let mut state = output.state.clone();
+            let c = egui::text::CCursor::new(self.content[..end_byte.min(self.content.len())].chars().count());
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(c)));
+            state.store(ctx, id);
+            self.ac_dismissed_at = None;
+            ctx.request_repaint();
+        }
+    }
+
+    fn quick_switcher(&mut self, ctx: &egui::Context) {
+        if !self.quick_open {
+            return;
+        }
+        let q = self.quick_query.trim().to_lowercase();
+        let mut results: Vec<(&MarkdownFile, u8)> = self
+            .store
+            .files
+            .iter()
+            .filter_map(|f| {
+                if q.is_empty() {
+                    return Some((f, 0));
+                }
+                if f.title().to_lowercase().contains(&q) {
+                    Some((f, 0))
+                } else if f.search_key.contains(&q) {
+                    Some((f, 1))
+                } else if self.store.meta_index.get(&f.relative_path).is_some_and(|m| {
+                    let tq = q.strip_prefix('#').unwrap_or(&q);
+                    m.tags.iter().any(|t| t.contains(tq)) || m.content_lower.contains(&q)
+                }) {
+                    Some((f, 2))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        results.sort_by_key(|(_, rank)| *rank);
+        results.truncate(10);
+        let len = results.len();
+        if self.quick_index >= len {
+            self.quick_index = 0;
+        }
+
+        if len > 0 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+            self.quick_index = (self.quick_index + 1) % len;
+        }
+        if len > 0 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+            self.quick_index = (self.quick_index + len - 1) % len;
+        }
+
+        let mut open_path: Option<String> = None;
+        let mut create_name: Option<String> = None;
+
+        egui::Area::new(egui::Id::new("quick_scrim"))
+            .fixed_pos(Pos2::ZERO)
+            .order(egui::Order::Middle)
+            .show(ctx, |ui| {
+                let screen = ui.ctx().content_rect();
+                if ui.allocate_rect(screen, Sense::click()).clicked() {
+                    self.quick_open = false;
+                }
+                ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(100));
+            });
+
+        egui::Window::new("quick_switcher")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 80.0))
+            .order(egui::Order::Foreground)
+            .frame(
+                egui::Frame::new()
+                    .fill(colors::BG_CARD)
+                    .corner_radius(12.0)
+                    .stroke(Stroke::new(1.0_f32, colors::BORDER_LIGHT))
+                    .shadow(ctx.style().visuals.window_shadow)
+                    .inner_margin(egui::Margin::same(12)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                let resp = text_field(ui, &mut self.quick_query, "Jump to note, #tag, or text… (⇧↩ create)");
+                if std::mem::take(&mut self.quick_focus) {
+                    resp.request_focus();
+                }
+                if resp.changed() {
+                    self.quick_index = 0;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let shift = ui.input(|i| i.modifiers.shift);
+                    if shift && !self.quick_query.trim().is_empty() {
+                        create_name = Some(self.quick_query.trim().to_string());
+                    } else if let Some((f, _)) = results.get(self.quick_index) {
+                        open_path = Some(f.relative_path.clone());
+                    }
+                }
+                ui.add_space(8.0);
+                if results.is_empty() {
+                    ui.label(RichText::new("No matching notes — press ⇧↩ to create").size(12.0).color(colors::TEXT_MUTED));
+                } else {
+                    for (idx, (file, rank)) in results.iter().enumerate() {
+                        let sel = idx == self.quick_index;
+                        let r = file_row(ui, file, sel, *rank == 2);
+                        if r.clicked() {
+                            open_path = Some(file.relative_path.clone());
+                        }
+                    }
+                }
+            });
+
+        if let Some(name) = create_name {
+            let content = format!("# {}\n\n", name.rsplit('/').next().unwrap_or(&name));
+            match self.store.create_file(&name, &content) {
+                Ok(path) => {
+                    self.quick_open = false;
+                    self.load_note(&path);
+                }
+                Err(e) => self.show_error(format!("Couldn't create note: {e}")),
+            }
+        } else if let Some(path) = open_path {
+            self.quick_open = false;
+            self.load_note(&path);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -847,8 +1411,8 @@ impl VaultApp {
                 ui.label(RichText::new("New note").size(14.0).color(colors::TEXT_PRIMARY));
                 ui.add_space(10.0);
                 let resp = text_field(ui, &mut self.new_note_input, "Name, or folder/name");
+                create |= ui.input(|i| i.key_pressed(egui::Key::Enter));
                 resp.request_focus();
-                create |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.add_space(14.0);
                 let (ok, no) = dialog_buttons(ui, "Create", false);
                 create |= ok;
@@ -880,8 +1444,8 @@ impl VaultApp {
                 ui.label(RichText::new("Rename note").size(14.0).color(colors::TEXT_PRIMARY));
                 ui.add_space(10.0);
                 let resp = text_field(ui, &mut self.rename_input, "New name");
+                rename |= ui.input(|i| i.key_pressed(egui::Key::Enter));
                 resp.request_focus();
-                rename |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.add_space(14.0);
                 let (ok, no) = dialog_buttons(ui, "Rename", false);
                 rename |= ok;
@@ -950,7 +1514,7 @@ impl VaultApp {
 // ---------------------------------------------------------------------------
 
 /// One sidebar row: note title, with the folder as a faint suffix when nested.
-fn file_row(ui: &mut egui::Ui, file: &MarkdownFile, selected: bool) -> egui::Response {
+fn file_row(ui: &mut egui::Ui, file: &MarkdownFile, selected: bool, content_match: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
     let title = file.title();
     let bg = if selected {
@@ -970,6 +1534,9 @@ fn file_row(ui: &mut egui::Ui, file: &MarkdownFile, selected: bool) -> egui::Res
     );
     if let Some((dir, _)) = file.relative_path.rsplit_once('/') {
         job.append(dir, 8.0, TextFormat { font_id: FontId::proportional(11.0), color: colors::TEXT_MUTED, ..Default::default() });
+    }
+    if content_match {
+        job.append("match", 8.0, TextFormat { font_id: FontId::proportional(10.5), color: colors::TEXT_ACCENT, ..Default::default() });
     }
     let galley = ui.fonts_mut(|f| f.layout_job(job));
     let pos = Pos2::new(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0);
@@ -1010,7 +1577,7 @@ fn dialog(ctx: &egui::Context, id: &str, add: impl FnOnce(&mut egui::Ui)) {
             egui::Frame::new()
                 .fill(colors::BG_CARD)
                 .corner_radius(12.0)
-                .stroke(Stroke::new(1.0, colors::BORDER_LIGHT))
+                .stroke(Stroke::new(1.0_f32, colors::BORDER_LIGHT))
                 .shadow(ctx.style().visuals.window_shadow)
                 .inner_margin(egui::Margin::same(18)),
         )
@@ -1025,7 +1592,7 @@ fn text_field(ui: &mut egui::Ui, value: &mut String, hint: &str) -> egui::Respon
     egui::Frame::new()
         .fill(colors::BG_INPUT)
         .corner_radius(7.0)
-        .stroke(Stroke::new(1.0, colors::BORDER_LIGHT))
+        .stroke(Stroke::new(1.0_f32, colors::BORDER_LIGHT))
         .inner_margin(egui::Margin::symmetric(10, 7))
         .show(ui, |ui| {
             ui.add(
@@ -1140,12 +1707,15 @@ enum Icon {
     Close,
     Up,
     Down,
+    Back,
+    Forward,
+    Outline,
 }
 
 fn paint_icon(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
     let c = rect.center();
     let s = rect.width().min(rect.height()) / 2.0;
-    let st = Stroke::new(1.4, color);
+    let st = Stroke::new(1.4_f32, color);
     match icon {
         Icon::Sidebar => {
             let r = Rect::from_center_size(c, Vec2::new(s * 1.3, s * 1.05));
@@ -1177,6 +1747,19 @@ fn paint_icon(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             p.line_segment([tip, tip + Vec2::new(-d, -dir * d)], st);
             p.line_segment([tip, tip + Vec2::new(d, -dir * d)], st);
         }
+        Icon::Back | Icon::Forward => {
+            let d = s * 0.34;
+            let dir = if matches!(icon, Icon::Back) { -1.0 } else { 1.0 };
+            let tip = c + Vec2::new(dir * d * 0.5, 0.0);
+            p.line_segment([tip, tip + Vec2::new(-dir * d, -d)], st);
+            p.line_segment([tip, tip + Vec2::new(-dir * d, d)], st);
+        }
+        Icon::Outline => {
+            let w = s * 0.6;
+            for (dy, inset) in [(-s * 0.36, 0.0), (0.0, s * 0.25), (s * 0.36, s * 0.25)] {
+                p.line_segment([Pos2::new(c.x - w + inset, c.y + dy), Pos2::new(c.x + w, c.y + dy)], st);
+            }
+        }
     }
 }
 
@@ -1194,6 +1777,51 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
     icon_button_sized(ui, icon, 24.0)
 }
 
+fn slugify_anchor(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.trim().chars().flat_map(char::to_lowercase) {
+        if c.is_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else if c == ' ' {
+            out.push('-');
+        }
+    }
+    out
+}
+
+/// Case-insensitive substring search that maps lowercase byte positions back to valid UTF-8 byte ranges in `haystack`.
+fn find_case_insensitive(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
+    let needle_lower = needle.to_lowercase();
+    if needle_lower.is_empty() {
+        return Vec::new();
+    }
+    let mut lower = String::with_capacity(haystack.len());
+    let mut map: Vec<(usize, usize)> = Vec::with_capacity(haystack.len());
+    for (orig_start, ch) in haystack.char_indices() {
+        let orig_end = orig_start + ch.len_utf8();
+        for lc in ch.to_lowercase() {
+            let mut buf = [0u8; 4];
+            let s = lc.encode_utf8(&mut buf);
+            lower.push_str(s);
+            for _ in 0..s.len() {
+                map.push((orig_start, orig_end));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let nlen = needle_lower.len();
+    while let Some(rel) = lower[pos..].find(&needle_lower) {
+        let start = pos + rel;
+        let end = start + nlen;
+        if let (Some(&(a, _)), Some(&(_, b))) = (map.get(start), map.get(end - 1)) {
+            out.push((a, b));
+        }
+        pos = end.max(start + 1);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1201,5 +1829,17 @@ mod tests {
         let text = "aé b é";
         // "é" is two bytes: matches at bytes 1..3 and 6..8 are chars 1..2 and 5..6.
         assert_eq!(super::byte_ranges_to_chars(text, &[(1, 3), (6, 8)]), vec![(1, 2), (5, 6)]);
+    }
+
+    #[test]
+    fn unicode_case_insensitive_find_never_panics() {
+        let text = "İstanbul ẞ Straße";
+        let hits = super::find_case_insensitive(text, "straße");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(&text[hits[0].0..hits[0].1], "Straße");
+
+        let hits2 = super::find_case_insensitive(text, "i\u{307}stanbul");
+        assert_eq!(hits2.len(), 1);
+        assert_eq!(&text[hits2[0].0..hits2[0].1], "İstanbul");
     }
 }

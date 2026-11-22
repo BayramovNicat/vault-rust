@@ -4,12 +4,12 @@
 use std::sync::Arc;
 
 use egui::{
-    epaint::text::cursor::CCursor, Align2, Color32, CornerRadius, FontId, Galley, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui, Vec2,
+    epaint::text::cursor::CCursor, Align2, Color32, CornerRadius, FontId, Galley, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, Vec2,
 };
 use pulldown_cmark::Alignment;
 
 use super::doc::{doc_for, ImageRef, RichBlock, RichKind};
-use super::layout::{alert_style, base, inline_job, tag_style, Cx, QUOTE_INDENT, RICH_MARGIN};
+use super::layout::{alert_style, base, inline_job, resolved_bold_family, tag_style, Cx, QUOTE_INDENT, RICH_MARGIN};
 use super::visual::{self, Env, ImageState, SvgVisual};
 use super::PreviewAction;
 use crate::theme::colors;
@@ -133,11 +133,18 @@ fn images_layout(ui: &Ui, imgs: &[ImageRef], width: f32, env: &Env) -> RichLayou
 
 fn table_layout(ui: &Ui, text: &str, rows: &[Vec<std::ops::Range<usize>>], width: f32, env: &Env) -> TableLayout {
     let doc = doc_for(text);
-    let cx = Cx { ui, root: text, doc: &doc, reveal: None, env, wrap: width };
+    let bold = resolved_bold_family(ui);
+    let cx = Cx { ui, root: text, doc: &doc, reveal: None, env, wrap: width, bold: &bold, overlay_code_pill: false };
     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
     let fmt_for = |r: usize| {
         let b = base(CELL_SIZE, colors::TEXT_PRIMARY);
-        if r == 0 { tag_style("b", &b) } else { b }
+        if r == 0 {
+            let mut f = tag_style("b", &b);
+            f.font_id.family = bold.clone();
+            f
+        } else {
+            b
+        }
     };
 
     // Natural (unwrapped) column widths.
@@ -234,23 +241,61 @@ pub fn paint(
     for cb in &doc.code {
         let top = geo.row(cb.range.start).top();
         let bottom = geo.row(cb.range.end).bottom();
-        let r = Rect::from_min_max(Pos2::new(left, top), Pos2::new(left + width, bottom));
+        let active = hit(cb.range.start, cb.range.end);
+        let box_top = if cb.fenced && !active { top + 4.0 } else { top };
+        let box_bottom = if cb.fenced && !active { (bottom - 12.0).max(box_top + 44.0) } else { bottom };
+        let r = Rect::from_min_max(Pos2::new(left, box_top), Pos2::new(left + width, box_bottom));
         if !visible(r) {
             continue;
         }
-        bg.push(Shape::rect_filled(r, 6.0, colors::BG_CODE));
-        bg.push(Shape::rect_stroke(r, 6.0, Stroke::new(1.0, colors::LINE), StrokeKind::Inside));
-        if cb.fenced && !hit(cb.range.start, cb.range.end) {
+        bg.push(Shape::rect_filled(r, 8.0, colors::BG_CODE));
+        bg.push(Shape::rect_stroke(r, 8.0, Stroke::new(1.0_f32, Color32::from_rgb(36, 36, 39)), StrokeKind::Inside));
+        if cb.fenced && !active {
+            let header_h = 32.0;
+            let header = Rect::from_min_size(r.min, Vec2::new(r.width(), header_h));
+            bg.push(Shape::rect_filled(
+                header,
+                CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 },
+                colors::BG_CODE,
+            ));
+            bg.push(Shape::line_segment(
+                [Pos2::new(r.left(), r.top() + header_h), Pos2::new(r.right(), r.top() + header_h)],
+                Stroke::new(1.0_f32, Color32::from_rgb(32, 32, 35)),
+            ));
             let label = if cb.lang.is_empty() { "code" } else { cb.lang.as_str() };
-            painter.text(Pos2::new(left + 14.0, top + 15.0), Align2::LEFT_CENTER, label, FontId::proportional(11.0), colors::TEXT_MUTED);
-            let btn = Rect::from_min_size(Pos2::new(left + width - 58.0, top + 4.0), Vec2::new(50.0, 22.0));
-            if ui.put(btn, egui::Button::new(RichText::new("Copy").size(10.5).color(colors::TEXT_SECONDARY))).clicked() {
-                let block = &text[cb.range.clone()];
-                let first_nl = block.find('\n').map_or(block.len(), |i| i + 1);
-                let last_nl = block.rfind('\n').unwrap_or(block.len());
-                let body = if last_nl > first_nl { &block[first_nl..last_nl] } else { &block[first_nl..] };
-                ui.ctx().copy_text(body.to_string());
+            painter.text(Pos2::new(left + 16.0, header.center().y), Align2::LEFT_CENTER, label, FontId::proportional(12.0), colors::TEXT_SECONDARY);
+
+            let copy_id = egui::Id::new(("code_copied", cb.range.start));
+            let copied_at = ui.data(|d| d.get_temp::<std::time::Instant>(copy_id));
+            let just_copied = copied_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(1500));
+            if just_copied {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
             }
+            let btn = Rect::from_center_size(Pos2::new(r.right() - 20.0, header.center().y), Vec2::new(26.0, 22.0));
+            let resp = ui.interact(btn, copy_id.with("btn"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            if resp.hovered() {
+                painter.rect_filled(btn, 5.0, Color32::from_white_alpha(14));
+            }
+            if just_copied {
+                let c = btn.center();
+                let st = Stroke::new(1.6_f32, colors::SUCCESS);
+                painter.line_segment([Pos2::new(c.x - 4.5, c.y + 0.5), Pos2::new(c.x - 1.0, c.y + 3.5)], st);
+                painter.line_segment([Pos2::new(c.x - 1.0, c.y + 3.5), Pos2::new(c.x + 5.0, c.y - 3.5)], st);
+            } else {
+                let col = if resp.hovered() { colors::TEXT_PRIMARY } else { colors::TEXT_SECONDARY };
+                let st = Stroke::new(1.2_f32, col);
+                let c = btn.center();
+                let back = Rect::from_min_size(Pos2::new(c.x - 5.0, c.y - 5.5), Vec2::splat(8.0));
+                let front = Rect::from_min_size(Pos2::new(c.x - 2.0, c.y - 2.5), Vec2::splat(8.0));
+                painter.rect_stroke(back, 1.5, st, StrokeKind::Middle);
+                painter.rect_filled(front, 1.5, colors::BG_CODE);
+                painter.rect_stroke(front, 1.5, st, StrokeKind::Middle);
+            }
+            if resp.clicked() {
+                ui.ctx().copy_text(text[cb.body.clone()].to_string());
+                ui.data_mut(|d| d.insert_temp(copy_id, std::time::Instant::now()));
+            }
+            resp.on_hover_text(if just_copied { "Copied" } else { "Copy code" });
         }
     }
 
@@ -259,16 +304,21 @@ pub fn paint(
         let top = geo.row(q.range.start).top();
         let bottom = geo.row(q.range.end).bottom();
         let x = left + QUOTE_INDENT * (q.depth as f32 - 1.0);
-        let color = q.alert.map_or(colors::ACCENT, |a| alert_style(a).1);
         let r = Rect::from_min_max(Pos2::new(x, top), Pos2::new(left + width, bottom));
         if !visible(r) {
             continue;
         }
-        if q.depth == 1 {
-            let tint = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 14);
-            bg.push(Shape::rect_filled(r, CornerRadius { nw: 0, sw: 0, ne: 4, se: 4 }, tint));
+        if let Some(alert) = q.alert {
+            let color = alert_style(alert).1;
+            if q.depth == 1 {
+                let tint = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 14);
+                bg.push(Shape::rect_filled(r, CornerRadius { nw: 0, sw: 0, ne: 4, se: 4 }, tint));
+            }
+            bg.push(Shape::rect_filled(Rect::from_min_size(Pos2::new(x, top), Vec2::new(3.0, bottom - top)), 1.5, color));
+        } else {
+            let bar = Rect::from_min_max(Pos2::new(x, top + 4.0), Pos2::new(x + 3.0, (bottom - 4.0).max(top + 10.0)));
+            bg.push(Shape::rect_filled(bar, 1.5, Color32::from_rgb(66, 66, 70)));
         }
-        bg.push(Shape::rect_filled(Rect::from_min_size(Pos2::new(x, top), Vec2::new(3.0, bottom - top)), 1.5, color));
     }
 
     // Horizontal rules
@@ -278,39 +328,70 @@ pub fn paint(
         }
         let row = geo.row(start);
         let y = row.center().y;
-        painter.line_segment([Pos2::new(left, y), Pos2::new(left + width, y)], Stroke::new(1.0, colors::LINE));
+        painter.line_segment([Pos2::new(left, y), Pos2::new(left + width, y)], Stroke::new(1.0_f32, colors::LINE));
     }
 
-    // H1/H2 underline
-    for (start, level, _) in &doc.headings {
-        if *level <= 2 && doc.quote_depth_at(*start).is_none() {
-            // Under the heading's last row (it may wrap); the row has extra space below the text for this.
-            let line_end = text[*start..].find('\n').map_or(text.len(), |i| start + i);
-            let row = geo.row(line_end);
-            if row.height() > 4.0 {
-                let y = row.bottom() - 6.0;
-                painter.line_segment([Pos2::new(left, y), Pos2::new(left + width, y)], Stroke::new(1.0, colors::LINE));
-            }
-        }
-    }
-
-    // Task checkboxes
+    // Task checkboxes (circular, matching Antigravity)
     for (range, checked) in &doc.tasks {
         let a = geo.row(range.start);
         let b = geo.row(range.end);
         if !visible(a) || a.top() != b.top() {
             continue;
         }
-        let side = 14.0;
+        let side = 15.0;
         let c = Pos2::new((a.left() + b.left()) / 2.0, a.center().y);
         let r = Rect::from_center_size(c, Vec2::splat(side));
         if *checked {
-            painter.rect_filled(r, 3.0, colors::ACCENT);
-            let s = Stroke::new(1.8, Color32::WHITE);
-            painter.line_segment([Pos2::new(r.left() + 3.2, c.y), Pos2::new(c.x - 1.0, r.bottom() - 3.5)], s);
-            painter.line_segment([Pos2::new(c.x - 1.0, r.bottom() - 3.5), Pos2::new(r.right() - 3.0, r.top() + 3.5)], s);
+            painter.rect_filled(r, 7.5, colors::ACCENT);
+            let s = Stroke::new(1.7_f32, Color32::WHITE);
+            painter.line_segment([Pos2::new(r.left() + 3.8, c.y + 0.2), Pos2::new(c.x - 1.0, r.bottom() - 3.8)], s);
+            painter.line_segment([Pos2::new(c.x - 1.0, r.bottom() - 3.8), Pos2::new(r.right() - 3.5, r.top() + 4.0)], s);
         } else {
-            painter.rect_stroke(r, 3.0, Stroke::new(1.3, colors::TEXT_SECONDARY), StrokeKind::Inside);
+            painter.rect_stroke(r, 7.5, Stroke::new(1.3_f32, Color32::from_rgb(62, 62, 66)), StrokeKind::Inside);
+        }
+    }
+
+    // Rounded inline `code` pills (centered on the glyph baseline/cap-height, not the row line-height)
+    for range in &doc.inline_codes {
+        if doc.rich_at(range.start).is_some() || doc.code_at(range.start).is_some() {
+            continue;
+        }
+        let a = geo.row(range.start);
+        let b = geo.row(range.end);
+        if !visible(a) && !visible(b) {
+            continue;
+        }
+        let pill_y = |row_idx: usize, col_idx: usize, fallback_cy: f32| -> (f32, f32) {
+            if let Some(pr) = galley.rows.get(row_idx) {
+                if let Some(g) = pr.glyphs.get(col_idx).or_else(|| pr.glyphs.first()) {
+                    let baseline = origin.y + pr.pos.y + g.pos.y;
+                    let asc = g.font_impl_ascent.max(8.0);
+                    return (baseline - asc * 0.72 - 4.0, baseline + asc * 0.36);
+                }
+            }
+            (fallback_cy - 9.0, fallback_cy + 9.0)
+        };
+        if (a.top() - b.top()).abs() < 0.5 && b.left() > a.left() {
+            let lc = galley.layout_from_cursor(CCursor::new(geo.char_idx(range.start)));
+            let (py0, py1) = pill_y(lc.row, lc.column, a.center().y);
+            let pill = Rect::from_min_max(Pos2::new(a.left() - 4.5, py0), Pos2::new(b.left() + 4.5, py1));
+            bg.push(Shape::rect_filled(pill, 4.5, Color32::from_rgb(26, 26, 28)));
+            bg.push(Shape::rect_stroke(pill, 4.5, Stroke::new(1.0_f32, Color32::from_rgb(38, 38, 41)), StrokeKind::Inside));
+        } else {
+            for (ri, row) in galley.rows.iter().enumerate() {
+                let rr = row.rect().translate(origin.to_vec2());
+                if rr.bottom() < a.top() + 0.5 || rr.top() > b.bottom() - 0.5 {
+                    continue;
+                }
+                let x0 = if (rr.top() - a.top()).abs() < 0.5 { a.left() } else { rr.left() };
+                let x1 = if (rr.top() - b.top()).abs() < 0.5 { b.left() } else { rr.right() };
+                if x1 > x0 + 1.0 {
+                    let (py0, py1) = pill_y(ri, 0, rr.center().y);
+                    let pill = Rect::from_min_max(Pos2::new(x0 - 4.5, py0), Pos2::new(x1 + 4.5, py1));
+                    bg.push(Shape::rect_filled(pill, 4.5, Color32::from_rgb(26, 26, 28)));
+                    bg.push(Shape::rect_stroke(pill, 4.5, Stroke::new(1.0_f32, Color32::from_rgb(38, 38, 41)), StrokeKind::Inside));
+                }
+            }
         }
     }
 
@@ -367,7 +448,7 @@ pub fn paint(
                             ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
                         }
                         _ => {
-                            painter.rect_stroke(r, 4.0, Stroke::new(1.0, colors::LINE), StrokeKind::Inside);
+                            painter.rect_stroke(r, 4.0, Stroke::new(1.0_f32, colors::LINE), StrokeKind::Inside);
                             let label = if it.alt.is_empty() { "image" } else { it.alt.as_str() };
                             painter.text(r.center(), Align2::CENTER_CENTER, format!("⚠ {label}"), FontId::proportional(12.0), colors::TEXT_MUTED);
                         }
@@ -501,7 +582,7 @@ fn table_interactive(ui: &mut Ui, text: &str, block: &RichBlock, t: &TableLayout
 
             if is_active {
                 if let Some(range) = &range {
-                    painter.rect_stroke(cell.shrink(1.0), 3.0, Stroke::new(1.5, colors::ACCENT), StrokeKind::Inside);
+                    painter.rect_stroke(cell.shrink(1.0), 3.0, Stroke::new(1.5_f32, colors::ACCENT), StrokeKind::Inside);
                     let has_focus = ui.memory(|m| m.has_focus(id));
                     // Keyboard navigation between cells.
                     let (tab, shift_tab) = if has_focus {
@@ -597,15 +678,15 @@ fn table_interactive(ui: &mut Ui, text: &str, block: &RichBlock, t: &TableLayout
 
             x += cw;
             if ci + 1 < row.len() {
-                painter.line_segment([Pos2::new(x, y), Pos2::new(x, y + h)], Stroke::new(1.0, colors::LINE));
+                painter.line_segment([Pos2::new(x, y), Pos2::new(x, y + h)], Stroke::new(1.0_f32, colors::LINE));
             }
         }
         y += h;
         if ri + 1 < t.cells.len() {
-            painter.line_segment([Pos2::new(origin.x, y), Pos2::new(origin.x + t.size.x, y)], Stroke::new(1.0, colors::LINE));
+            painter.line_segment([Pos2::new(origin.x, y), Pos2::new(origin.x + t.size.x, y)], Stroke::new(1.0_f32, colors::LINE));
         }
     }
-    painter.rect_stroke(r, 6.0, Stroke::new(1.0, colors::LINE), StrokeKind::Inside);
+    painter.rect_stroke(r, 6.0, Stroke::new(1.0_f32, colors::LINE), StrokeKind::Inside);
 
     // Structural edits rebuild the whole table.
     if let Some(op) = op {

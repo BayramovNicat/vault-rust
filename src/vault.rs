@@ -6,10 +6,85 @@ use std::time::SystemTime;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-use crate::wiki_links::{parse_wiki_links_with_lines, LinkIndex, WikiResolver};
+use crate::wiki_links::{parse_wiki_links_with_lines, rewrite_wiki_links, LinkIndex, WikiResolver};
 
 /// Folders that never hold notes (besides hidden ones).
 const SKIPPED_DIRS: [&str; 4] = ["node_modules", "dist", "build", "target"];
+
+#[derive(Clone, Debug, Default)]
+pub struct NoteMeta {
+    pub tags: Vec<String>,
+    pub content_lower: String,
+}
+
+impl NoteMeta {
+    pub fn from_content(content: &str) -> Self {
+        let tags = extract_tags(content);
+        let content_lower = content.to_lowercase();
+        Self { tags, content_lower }
+    }
+}
+
+fn extract_tags(content: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |t: &str| {
+        let clean = t.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && c != '/').to_lowercase();
+        if !clean.is_empty() && seen.insert(clean.clone()) {
+            tags.push(clean);
+        }
+    };
+
+    // YAML frontmatter `tags: [a, b]` or `- tag`
+    let mut lines = content.lines();
+    if lines.next().is_some_and(|l| l.trim() == "---") {
+        let mut in_tags_list = false;
+        for line in &mut lines {
+            let t = line.trim();
+            if t == "---" {
+                break;
+            }
+            if let Some(rest) = t.strip_prefix("tags:") {
+                let rest = rest.trim();
+                if rest.is_empty() {
+                    in_tags_list = true;
+                } else {
+                    for part in rest.trim_matches(['[', ']']).split(',') {
+                        push(part);
+                    }
+                    in_tags_list = false;
+                }
+            } else if in_tags_list {
+                if let Some(item) = t.strip_prefix("- ") {
+                    push(item);
+                } else {
+                    in_tags_list = false;
+                }
+            }
+        }
+    }
+
+    // Inline `#hashtags` (outside code blocks, preceded by start-of-line or whitespace)
+    let mut in_fence = false;
+    for line in content.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || t.starts_with('#') {
+            continue;
+        }
+        for word in line.split_whitespace() {
+            if let Some(tag) = word.strip_prefix('#') {
+                if tag.chars().next().is_some_and(|c| c.is_alphabetic()) {
+                    push(tag);
+                }
+            }
+        }
+    }
+    tags
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkdownFile {
@@ -38,6 +113,7 @@ pub struct VaultStore {
     /// Newest first.
     pub files: Vec<MarkdownFile>,
     pub link_index: LinkIndex,
+    pub meta_index: HashMap<String, NoteMeta>,
     /// mtime of each file when its links were indexed, so external edits get re-indexed.
     indexed_mtime: HashMap<String, SystemTime>,
     resolver: WikiResolver,
@@ -81,6 +157,7 @@ impl VaultStore {
             root,
             files: Vec::new(),
             link_index: HashMap::new(),
+            meta_index: HashMap::new(),
             indexed_mtime: HashMap::new(),
             resolver: WikiResolver::new(&[]),
             _watcher: watcher,
@@ -117,6 +194,7 @@ impl VaultStore {
 
         let current: HashSet<&str> = self.files.iter().map(|f| f.relative_path.as_str()).collect();
         self.link_index.retain(|k, _| current.contains(k.as_str()));
+        self.meta_index.retain(|k, _| current.contains(k.as_str()));
         self.indexed_mtime.retain(|k, _| current.contains(k.as_str()));
 
         let stale: Vec<(String, SystemTime)> = self
@@ -172,6 +250,7 @@ impl VaultStore {
 
     fn index(&mut self, relative_path: &str, content: &str, mtime: SystemTime) {
         self.link_index.insert(relative_path.to_string(), parse_wiki_links_with_lines(content));
+        self.meta_index.insert(relative_path.to_string(), NoteMeta::from_content(content));
         self.indexed_mtime.insert(relative_path.to_string(), mtime);
     }
 
@@ -233,8 +312,15 @@ impl VaultStore {
         }
         fs::rename(self.resolve_path(old_path), &new_full)?;
 
+        // Collect backlinks before mutating resolver/index so we can rewrite [[old]] -> [[new]].
+        let backlinks = self.resolver.find_backlinks(old_path, &self.link_index);
+        let old_resolver = WikiResolver::new(&self.files);
+
         if let Some(links) = self.link_index.remove(old_path) {
             self.link_index.insert(new_rel.clone(), links);
+        }
+        if let Some(meta) = self.meta_index.remove(old_path) {
+            self.meta_index.insert(new_rel.clone(), meta);
         }
         if let Some(mtime) = self.indexed_mtime.remove(old_path) {
             self.indexed_mtime.insert(new_rel.clone(), mtime);
@@ -244,6 +330,14 @@ impl VaultStore {
         }
         self.sort_files();
         self.rebuild_resolver();
+
+        for bl in backlinks {
+            if let Ok(content) = self.read_file(&bl.source_path) {
+                if let Some(updated) = rewrite_wiki_links(&content, old_path, &new_rel, &old_resolver) {
+                    let _ = self.write_file(&bl.source_path, &updated);
+                }
+            }
+        }
         Ok(new_rel)
     }
 
@@ -253,10 +347,35 @@ impl VaultStore {
             fs::remove_file(full_path)?;
         }
         self.link_index.remove(relative_path);
+        self.meta_index.remove(relative_path);
         self.indexed_mtime.remove(relative_path);
         self.files.retain(|f| f.relative_path != relative_path);
         self.rebuild_resolver();
         Ok(())
+    }
+
+    /// Copies an external image or asset into `<vault>/assets/` and returns its relative path.
+    pub fn import_asset(&self, src: &Path) -> std::io::Result<String> {
+        let assets_dir = self.root.join("assets");
+        fs::create_dir_all(&assets_dir)?;
+        let fname = src.file_name().and_then(|n| n.to_str()).unwrap_or("asset");
+        let mut dest = assets_dir.join(fname);
+        if dest.exists() {
+            let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("asset");
+            let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let mut n = 1;
+            loop {
+                let candidate = if ext.is_empty() { format!("{stem}-{n}") } else { format!("{stem}-{n}.{ext}") };
+                dest = assets_dir.join(&candidate);
+                if !dest.exists() {
+                    break;
+                }
+                n += 1;
+            }
+        }
+        fs::copy(src, &dest)?;
+        let rel = dest.strip_prefix(&self.root).unwrap_or(&dest);
+        Ok(rel.to_string_lossy().replace('\\', "/"))
     }
 
     pub fn resolve_path(&self, relative_path: &str) -> PathBuf {
@@ -295,6 +414,8 @@ mod tests {
         assert_eq!(renamed, "sub/c.md");
         assert!(store.file("sub/b.md").is_none() && store.file("sub/c.md").is_some());
         assert_eq!(store.resolver().resolve("c").as_deref(), Some("sub/c.md"));
+        assert_eq!(store.read_file("a.md").unwrap(), "links to [[c]]");
+        assert_eq!(store.resolver().find_backlinks("sub/c.md", &store.link_index).len(), 1);
 
         store.delete_file("a.md").unwrap();
         assert_eq!(store.files.len(), 1);

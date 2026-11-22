@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use egui::{
     text::{LayoutJob, TextFormat},
-    Color32, FontId, Stroke, Ui,
+    Color32, FontFamily, FontId, Stroke, Ui,
 };
 
 use super::doc::{doc_for, is_fence_line, Alert, Doc, RichKind};
@@ -18,12 +18,15 @@ use super::overlay::rich_layout;
 use super::visual::{self, Env};
 use crate::theme::colors;
 
-pub const BODY_SIZE: f32 = 14.5;
-pub const CODE_PAD: f32 = 14.0;
-pub const QUOTE_INDENT: f32 = 18.0;
-pub const RICH_MARGIN: f32 = 8.0;
+pub const BODY_SIZE: f32 = 15.0;
+pub const BODY_LINE_HEIGHT: f32 = 24.0;
+pub const LIST_LINE_HEIGHT: f32 = 30.0;
+pub const CODE_PAD: f32 = 16.0;
+pub const QUOTE_INDENT: f32 = 20.0;
+pub const RICH_MARGIN: f32 = 10.0;
 /// Background of inline `code`.
-const CODE_BG: Color32 = Color32::from_rgb(38, 38, 46);
+const CODE_BG: Color32 = Color32::from_rgb(24, 24, 27);
+const CODE_FG: Color32 = Color32::from_rgb(148, 178, 232);
 
 // ---------------------------------------------------------------------------
 // Formats
@@ -31,7 +34,7 @@ const CODE_BG: Color32 = Color32::from_rgb(38, 38, 46);
 
 pub fn hidden() -> TextFormat {
     TextFormat {
-        font_id: FontId::proportional(1.0),
+        font_id: FontId::proportional(0.01),
         color: Color32::TRANSPARENT,
         ..Default::default()
     }
@@ -46,6 +49,18 @@ pub fn base(size: f32, color: Color32) -> TextFormat {
     TextFormat {
         font_id: FontId::proportional(size),
         color,
+        line_height: Some((size * 1.6).round()),
+        valign: egui::Align::Center,
+        ..Default::default()
+    }
+}
+
+fn base_with_lh(size: f32, color: Color32, lh: f32) -> TextFormat {
+    TextFormat {
+        font_id: FontId::proportional(size),
+        color,
+        line_height: Some(lh),
+        valign: egui::Align::Center,
         ..Default::default()
     }
 }
@@ -54,6 +69,8 @@ fn mono(size: f32, color: Color32) -> TextFormat {
     TextFormat {
         font_id: FontId::monospace(size),
         color,
+        line_height: Some((size * 1.54).round()),
+        valign: egui::Align::Center,
         ..Default::default()
     }
 }
@@ -61,7 +78,7 @@ fn mono(size: f32, color: Color32) -> TextFormat {
 fn link_format(fmt: &TextFormat) -> TextFormat {
     TextFormat {
         color: colors::TEXT_ACCENT,
-        underline: Stroke::new(1.0, Color32::from_rgba_unmultiplied(115, 160, 255, 90)),
+        underline: Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(115, 160, 255, 90)),
         ..fmt.clone()
     }
 }
@@ -88,6 +105,8 @@ pub struct Cx<'a> {
     pub reveal: Option<(usize, usize)>,
     pub env: &'a Env,
     pub wrap: f32,
+    pub bold: &'a FontFamily,
+    pub overlay_code_pill: bool,
 }
 
 impl Cx<'_> {
@@ -102,6 +121,18 @@ impl Cx<'_> {
     fn glyph_or(&self, c: &'static str, fallback: &'static str) -> &'static str {
         let ch = c.chars().next().unwrap_or(' ');
         if self.ui.fonts_mut(|f| f.has_glyph(&FontId::proportional(BODY_SIZE), ch)) { c } else { fallback }
+    }
+    fn bold_style(&self, size: f32) -> FontId {
+        FontId::new(size, self.bold.clone())
+    }
+}
+
+pub fn resolved_bold_family(ui: &Ui) -> FontFamily {
+    let bold = crate::theme::bold_family();
+    if ui.fonts(|f| f.definitions().families.contains_key(&bold)) {
+        bold
+    } else {
+        FontFamily::Proportional
     }
 }
 
@@ -147,6 +178,27 @@ struct JobKey {
     env: u64,
     /// Rich blocks shown as source and code blocks shown with fences (both follow the cursor).
     revealed: Vec<usize>,
+    /// `<details>` blocks currently expanded.
+    open_details: Vec<usize>,
+}
+
+fn details_toggles_id() -> egui::Id {
+    egui::Id::new("vault_details_toggles")
+}
+
+pub fn is_details_open(ctx: &egui::Context, start: usize) -> bool {
+    ctx.data(|d| d.get_temp::<std::collections::HashSet<usize>>(details_toggles_id()))
+        .is_some_and(|set| set.contains(&start))
+}
+
+pub fn toggle_details(ctx: &egui::Context, start: usize) {
+    ctx.data_mut(|d| {
+        let mut set = d.get_temp::<std::collections::HashSet<usize>>(details_toggles_id()).unwrap_or_default();
+        if !set.remove(&start) {
+            set.insert(start);
+        }
+        d.insert_temp(details_toggles_id(), set);
+    });
 }
 
 thread_local! {
@@ -170,12 +222,19 @@ fn job_key(cx: &Cx, doc: &Doc) -> JobKey {
     let code = doc.code.iter().enumerate().filter(|(_, b)| cx.hit(b.range.start, b.range.end));
     // Code blocks go after rich blocks in the list so the two can't be confused.
     let revealed = rich.map(|(i, _)| i).chain(code.map(|(i, _)| doc.rich.len() + i)).collect();
+    let open_details = doc
+        .details
+        .iter()
+        .filter(|d| is_details_open(cx.ui.ctx(), d.start) || cx.hit(d.body_start, d.end))
+        .map(|d| d.start)
+        .collect();
     JobKey {
         text: doc.hash,
         wrap: cx.wrap.to_bits(),
         pixels_per_point: cx.ui.ctx().pixels_per_point().to_bits(),
         env: env.finish(),
         revealed,
+        open_details,
     }
 }
 
@@ -183,7 +242,8 @@ fn job_key(cx: &Cx, doc: &Doc) -> JobKey {
 /// (`None` when the editor isn't focused). Only rich blocks react to it.
 pub fn live_layouter(ui: &Ui, text: &str, wrap_width: f32, reveal: Option<(usize, usize)>, env: &Env) -> Arc<egui::Galley> {
     let doc = doc_for(text);
-    let cx = Cx { ui, root: text, doc: &doc, reveal, env, wrap: wrap_width };
+    let bold = resolved_bold_family(ui);
+    let cx = Cx { ui, root: text, doc: &doc, reveal, env, wrap: wrap_width, bold: &bold, overlay_code_pill: true };
 
     let key = job_key(&cx, &doc);
     let cached = JOB_CACHE.with(|c| c.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, job)| job.clone()));
@@ -261,6 +321,16 @@ fn line_mode(cx: &Cx, start: usize, end: usize) -> Mode {
     if doc.rules.contains(&start) {
         return Mode::Rule;
     }
+    if let Some(db) = doc.details_body_at(start) {
+        if !is_details_open(cx.ui.ctx(), db.start) && !cx.hit(db.body_start, db.end) {
+            return Mode::Collapsed;
+        }
+    }
+    if let Some(db) = doc.details.iter().find(|d| d.start == start && d.summary_line != start) {
+        if !cx.hit(db.start, db.start) {
+            return Mode::Collapsed;
+        }
+    }
     Mode::Normal
 }
 
@@ -269,12 +339,12 @@ fn row_format(mode: &Mode) -> TextFormat {
         Mode::Collapsed => hidden_h(0.0),
         Mode::Gap(h) => hidden_h(*h),
         Mode::Raw => mono(13.0, colors::TEXT_SECONDARY),
-        Mode::Code { fence: true, active: false, opening, .. } => hidden_h(if *opening { 30.0 } else { 12.0 }),
+        Mode::Code { fence: true, active: false, opening, .. } => hidden_h(if *opening { 44.0 } else { 22.0 }),
         Mode::Code { .. } => mono(13.0, colors::TEXT_PRIMARY),
         Mode::Frontmatter { fence: true } => hidden_h(8.0),
         Mode::Frontmatter { .. } => mono(12.0, colors::TEXT_MUTED),
-        Mode::Rule => hidden_h(24.0),
-        Mode::Normal => base(BODY_SIZE, colors::TEXT_PRIMARY),
+        Mode::Rule => hidden_h(26.0),
+        Mode::Normal => base_with_lh(BODY_SIZE, colors::TEXT_PRIMARY, BODY_LINE_HEIGHT),
     }
 }
 
@@ -292,7 +362,7 @@ fn layout_line(cx: &Cx, w: &mut W, line: &str, start: usize, mode: &Mode) {
                 w.lead = CODE_PAD;
                 w.add(line, mono(11.0, Color32::from_rgba_unmultiplied(120, 122, 138, 150)));
             } else {
-                w.add(line, hidden_h(if *opening { 30.0 } else { 12.0 }));
+                w.add(line, hidden_h(if *opening { 44.0 } else { 22.0 }));
             }
         }
         Mode::Code { .. } => code_line(cx, w, line, start),
@@ -302,7 +372,7 @@ fn layout_line(cx: &Cx, w: &mut W, line: &str, start: usize, mode: &Mode) {
 
 fn code_line(cx: &Cx, w: &mut W, line: &str, start: usize) {
     w.lead = CODE_PAD;
-    let plain = mono(13.0, Color32::from_rgb(220, 222, 235));
+    let plain = mono(13.0, Color32::from_rgb(214, 214, 218));
     let Some(cb) = cx.doc.code_at(start) else {
         w.add(line, plain);
         return;
@@ -365,7 +435,7 @@ fn normal_line(cx: &Cx, w: &mut W, line: &str, start: usize) {
             }
             fmt = body.clone();
         } else {
-            fmt = TextFormat { italics: true, ..base(BODY_SIZE, colors::TEXT_SECONDARY) };
+            fmt = base_with_lh(BODY_SIZE, Color32::from_rgb(207, 207, 209), LIST_LINE_HEIGHT);
         }
     }
 
@@ -385,30 +455,31 @@ fn normal_line(cx: &Cx, w: &mut W, line: &str, start: usize) {
 
     // Setext heading title line.
     if let Some(&level) = cx.doc.setext_titles.get(&start) {
-        inline(cx, w, rest, &heading_format(level as usize));
+        inline(cx, w, rest, &heading_format(cx, level as usize));
         return;
     }
 
     body_line(cx, w, rest, &fmt);
 }
 
-/// Text format for a heading. H1/H2 rows get extra space below the text for their underline.
-fn heading_format(level: usize) -> TextFormat {
+/// Text format for a heading using a bold typeface and generous vertical rhythm.
+fn heading_format(cx: &Cx, level: usize) -> TextFormat {
     let (size, color) = heading_style(level);
-    let mut f = base(size, color);
-    if level <= 2 {
-        f.line_height = Some((size * 1.25 + 14.0).round());
-        f.valign = egui::Align::TOP;
+    TextFormat {
+        font_id: cx.bold_style(size),
+        color,
+        line_height: Some((size * 1.65).round()),
+        valign: egui::Align::Center,
+        ..Default::default()
     }
-    f
 }
 
 pub fn heading_style(level: usize) -> (f32, Color32) {
     match level {
-        1 => (28.0, Color32::WHITE),
-        2 => (22.0, Color32::from_rgb(240, 240, 248)),
-        3 => (18.0, Color32::from_rgb(232, 232, 242)),
-        4 => (16.0, Color32::from_rgb(220, 220, 232)),
+        1 => (24.0, Color32::WHITE),
+        2 => (19.5, Color32::from_rgb(244, 244, 246)),
+        3 => (16.5, Color32::from_rgb(236, 236, 240)),
+        4 => (15.0, Color32::from_rgb(224, 224, 228)),
         5 => (14.5, colors::TEXT_SECONDARY),
         _ => (13.5, colors::TEXT_MUTED),
     }
@@ -450,21 +521,26 @@ fn body_line(cx: &Cx, w: &mut W, line: &str, fmt: &TextFormat) {
         let marker_len = (hashes + 1).min(rest.len());
         w.add(&rest[..marker_len], hidden());
         let body = rest[marker_len..].trim_end_matches(['#', ' ']);
-        inline(cx, w, body, &heading_format(hashes));
+        inline(cx, w, body, &heading_format(cx, hashes));
         w.add(&rest[marker_len + body.len()..], hidden());
         return;
     }
 
     // Task item
     if let Some((checked, r)) = task_prefix(rest) {
+        let list_fmt = base_with_lh(fmt.font_id.size, fmt.color, LIST_LINE_HEIGHT);
         w.add(&rest[..r.start], hidden());
-        w.lead += 2.0;
+        w.lead += 4.0;
         // The box itself is painted by the overlay over these transparent chars.
         w.add(&rest[r.clone()], mono(BODY_SIZE, Color32::TRANSPARENT));
+        w.lead += 6.0;
         let item_fmt = if checked {
-            TextFormat { strikethrough: Stroke::new(1.0, colors::TEXT_MUTED), ..base(fmt.font_id.size, colors::TEXT_MUTED) }
+            TextFormat {
+                strikethrough: Stroke::new(1.0_f32, colors::TEXT_MUTED),
+                ..base_with_lh(fmt.font_id.size, colors::TEXT_MUTED, LIST_LINE_HEIGHT)
+            }
         } else {
-            fmt.clone()
+            list_fmt
         };
         inline(cx, w, &rest[r.end..], &item_fmt);
         return;
@@ -473,25 +549,29 @@ fn body_line(cx: &Cx, w: &mut W, line: &str, fmt: &TextFormat) {
     let b = rest.as_bytes();
     // Bullet
     if b.len() >= 2 && matches!(b[0], b'-' | b'*' | b'+') && (b[1] == b' ' || b[1] == b'\t') {
+        let list_fmt = base_with_lh(fmt.font_id.size, fmt.color, LIST_LINE_HEIGHT);
         let level = indent_cols / 2;
         let glyph = match level % 3 {
             0 => "•",
             1 => cx.glyph_or("◦", "•"),
             _ => cx.glyph_or("▪", "•"),
         };
-        w.lead += 4.0;
-        w.add(glyph, base(BODY_SIZE, colors::TEXT_MUTED));
-        w.add(&rest[1..2], fmt.clone());
-        inline(cx, w, &rest[2..], fmt);
+        w.lead += 10.0;
+        w.add(glyph, base_with_lh(BODY_SIZE, Color32::from_rgb(212, 212, 214), LIST_LINE_HEIGHT));
+        w.lead = 6.0;
+        w.add(&rest[1..2], list_fmt.clone());
+        inline(cx, w, &rest[2..], &list_fmt);
         return;
     }
     // Ordered list
     let digits = b.iter().take_while(|c| c.is_ascii_digit()).count();
     if digits > 0 && digits < 10 && b.len() > digits + 1 && matches!(b[digits], b'.' | b')') && b[digits + 1] == b' ' {
-        w.lead += 2.0;
-        w.add(&rest[..digits + 1], base(fmt.font_id.size, colors::TEXT_SECONDARY));
-        w.add(" ", fmt.clone());
-        inline(cx, w, &rest[digits + 2..], fmt);
+        let list_fmt = base_with_lh(fmt.font_id.size, fmt.color, LIST_LINE_HEIGHT);
+        w.lead += 4.0;
+        w.add(&rest[..digits + 1], base_with_lh(fmt.font_id.size, Color32::from_rgb(212, 212, 214), LIST_LINE_HEIGHT));
+        w.lead = 5.0;
+        w.add(" ", list_fmt.clone());
+        inline(cx, w, &rest[digits + 2..], &list_fmt);
         return;
     }
     // Definition list: `: definition`
@@ -516,24 +596,25 @@ pub fn tag_style(name: &str, fmt: &TextFormat) -> TextFormat {
     match name {
         "kbd" => TextFormat {
             font_id: FontId::monospace(size * 0.85),
-            background: Color32::from_rgb(40, 42, 50),
-            color: colors::TEXT_PRIMARY,
+            background: Color32::from_rgb(34, 34, 38),
+            color: Color32::from_rgb(212, 212, 216),
+            expand_bg: 3.0,
             ..fmt.clone()
         },
         "code" => TextFormat {
             font_id: FontId::monospace(size * 0.88),
-            color: Color32::from_rgb(240, 180, 140),
+            color: CODE_FG,
             background: CODE_BG,
-            expand_bg: 1.5,
+            expand_bg: 3.0,
             ..fmt.clone()
         },
         "mark" => TextFormat { background: Color32::from_rgba_unmultiplied(200, 165, 40, 70), color: Color32::WHITE, ..fmt.clone() },
-        "u" | "ins" => TextFormat { underline: Stroke::new(1.0, fmt.color), ..fmt.clone() },
+        "u" | "ins" => TextFormat { underline: Stroke::new(1.0_f32, fmt.color), ..fmt.clone() },
         "sub" => TextFormat { font_id: FontId::proportional(size * 0.72), valign: egui::Align::BOTTOM, ..fmt.clone() },
         "sup" => TextFormat { font_id: FontId::proportional(size * 0.72), valign: egui::Align::TOP, ..fmt.clone() },
-        "b" | "strong" => TextFormat { color: Color32::WHITE, font_id: FontId::proportional(size + 0.5), ..fmt.clone() },
+        "b" | "strong" => TextFormat { color: Color32::WHITE, font_id: FontId::new(size, crate::theme::bold_family()), ..fmt.clone() },
         "i" | "em" => TextFormat { italics: true, ..fmt.clone() },
-        "s" | "del" | "strike" => TextFormat { strikethrough: Stroke::new(1.0, fmt.color), color: colors::TEXT_SECONDARY, ..fmt.clone() },
+        "s" | "del" | "strike" => TextFormat { strikethrough: Stroke::new(1.0_f32, fmt.color), color: colors::TEXT_SECONDARY, ..fmt.clone() },
         "small" => TextFormat { font_id: FontId::proportional(size * 0.82), ..fmt.clone() },
         _ => fmt.clone(),
     }
@@ -714,14 +795,23 @@ pub fn inline(cx: &Cx, w: &mut W, s: &str, fmt: &TextFormat) {
                         if let Some(crel) = s[tag_end..].to_ascii_lowercase().find(&closing) {
                             let cstart = tag_end + crel;
                             w.add(tag, hidden());
-                            inline(cx, w, &s[tag_end..cstart], &tag_style(&name, fmt));
+                            let mut styled = tag_style(&name, fmt);
+                            if matches!(name.as_str(), "b" | "strong") {
+                                styled.font_id = cx.bold_style(fmt.font_id.size);
+                            }
+                            inline(cx, w, &s[tag_end..cstart], &styled);
                             w.add(&s[cstart..cstart + closing.len()], hidden());
                             done!(cstart + closing.len());
                         }
                     }
                     if name == "summary" && !tag.starts_with("</") {
-                        let arrow = cx.glyph_or("▸", ">");
-                        w.add(arrow, base(size, colors::ACCENT));
+                        let line_start = cx.root[..base_off + i].rfind('\n').map_or(0, |p| p + 1);
+                        let open = cx.doc.details_summary_at(line_start).is_some_and(|db| {
+                            is_details_open(cx.ui.ctx(), db.start) || cx.hit(db.body_start, db.end)
+                        });
+                        let arrow = if open { cx.glyph_or("▾", "v") } else { cx.glyph_or("▸", ">") };
+                        w.add(arrow, base_with_lh(size, colors::TEXT_PRIMARY, LIST_LINE_HEIGHT));
+                        w.lead = 6.0;
                         let first_len = tag.chars().next().map_or(1, char::len_utf8);
                         w.add(&tag[first_len..], hidden());
                         done!(tag_end);
@@ -752,15 +842,21 @@ pub fn inline(cx: &Cx, w: &mut W, s: &str, fmt: &TextFormat) {
                 flush!();
                 let code = TextFormat {
                     font_id: FontId::monospace(size * 0.88),
-                    color: Color32::from_rgb(240, 180, 140),
-                    background: CODE_BG,
-            expand_bg: 1.5,
+                    color: CODE_FG,
+                    background: if cx.overlay_code_pill { Color32::TRANSPARENT } else { CODE_BG },
+                    expand_bg: if cx.overlay_code_pill { 0.0 } else { 2.0 },
                     italics: false,
                     ..fmt.clone()
                 };
+                if cx.overlay_code_pill {
+                    w.lead += 4.5;
+                }
                 w.add(delim, hidden());
                 w.add(&s[i + ticks..close], code);
                 w.add(delim, hidden());
+                if cx.overlay_code_pill {
+                    w.lead += 7.0;
+                }
                 done!(close + ticks);
             } else {
                 // Unmatched run of backticks: skip it whole.
@@ -791,6 +887,33 @@ pub fn inline(cx: &Cx, w: &mut W, s: &str, fmt: &TextFormat) {
             }
         }
 
+        // ***bold italic*** / ___bold italic___
+        let mut matched3 = None;
+        for delim in ["***", "___"] {
+            if !s[i..].starts_with(delim) || (delim == "___" && prev_alnum) {
+                continue;
+            }
+            if let Some(rel) = s[i + 3..].find(delim) {
+                let close = i + 3 + rel;
+                let content = &s[i + 3..close];
+                if content.is_empty() || content.starts_with(' ') || content.ends_with(' ') {
+                    continue;
+                }
+                matched3 = Some((delim, close));
+                break;
+            }
+        }
+        if let Some((delim, close)) = matched3 {
+            flush!();
+            let mut b_fmt = tag_style("b", fmt);
+            b_fmt.font_id = cx.bold_style(fmt.font_id.size);
+            let styled = tag_style("i", &b_fmt);
+            w.add(delim, hidden());
+            inline(cx, w, &s[i + 3..close], &styled);
+            w.add(delim, hidden());
+            done!(close + 3);
+        }
+
         // **bold** / __bold__ / ~~strike~~ / ==highlight==
         let mut matched = None;
         for delim in ["**", "__", "~~", "=="] {
@@ -810,7 +933,11 @@ pub fn inline(cx: &Cx, w: &mut W, s: &str, fmt: &TextFormat) {
         if let Some((delim, close)) = matched {
             flush!();
             let styled = match delim {
-                "**" | "__" => tag_style("b", fmt),
+                "**" | "__" => {
+                    let mut f = tag_style("b", fmt);
+                    f.font_id = cx.bold_style(fmt.font_id.size);
+                    f
+                }
                 "~~" => tag_style("s", fmt),
                 _ => tag_style("mark", fmt),
             };

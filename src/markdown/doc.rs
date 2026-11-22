@@ -107,16 +107,27 @@ pub struct Quote {
     pub alert: Option<Alert>,
 }
 
+#[derive(Clone, Debug)]
+pub struct DetailsBlock {
+    pub start: usize,
+    pub summary_line: usize,
+    pub body_start: usize,
+    pub end: usize,
+}
+
 #[derive(Default)]
 pub struct Doc {
     pub hash: u64,
     pub rich: Vec<RichBlock>,
     pub code: Vec<CodeBlock>,
     pub quotes: Vec<Quote>,
+    pub details: Vec<DetailsBlock>,
     /// `[ ]` / `[x]` marker ranges.
     pub tasks: Vec<(Range<usize>, bool)>,
     /// Inline math: start of the `$` -> end (exclusive) of the closing `$`.
     pub inline_math: HashMap<usize, usize>,
+    /// Inline `` `code` `` inner content byte ranges (excluding backticks).
+    pub inline_codes: Vec<Range<usize>>,
     pub frontmatter: Option<Range<usize>>,
     pub footnote_defs: Vec<Range<usize>>,
     /// Line start of a setext heading's title line -> level.
@@ -132,10 +143,12 @@ pub struct Doc {
 
 impl Doc {
     pub fn rich_at(&self, line_start: usize) -> Option<&RichBlock> {
-        self.rich.iter().find(|b| b.range.start <= line_start && line_start <= b.range.end)
+        let idx = self.rich.partition_point(|b| b.range.start <= line_start);
+        idx.checked_sub(1).and_then(|i| self.rich.get(i)).filter(|b| line_start <= b.range.end)
     }
     pub fn code_at(&self, line_start: usize) -> Option<&CodeBlock> {
-        self.code.iter().find(|b| b.range.start <= line_start && line_start <= b.range.end)
+        let idx = self.code.partition_point(|b| b.range.start <= line_start);
+        idx.checked_sub(1).and_then(|i| self.code.get(i)).filter(|b| line_start <= b.range.end)
     }
     pub fn quote_depth_at(&self, line_start: usize) -> Option<&Quote> {
         self.quotes
@@ -150,7 +163,14 @@ impl Doc {
             .find_map(|q| q.alert)
     }
     pub fn in_footnote_def(&self, line_start: usize) -> bool {
-        self.footnote_defs.iter().any(|r| r.start <= line_start && line_start <= r.end)
+        let idx = self.footnote_defs.partition_point(|r| r.start <= line_start);
+        idx.checked_sub(1).is_some_and(|i| line_start <= self.footnote_defs[i].end)
+    }
+    pub fn details_summary_at(&self, line_start: usize) -> Option<&DetailsBlock> {
+        self.details.iter().find(|d| d.summary_line == line_start)
+    }
+    pub fn details_body_at(&self, line_start: usize) -> Option<&DetailsBlock> {
+        self.details.iter().find(|d| d.body_start <= line_start && line_start <= d.end)
     }
     /// Byte offset of every char of `text` (the text this doc was parsed from).
     pub fn char_starts(&self, text: &str) -> &[usize] {
@@ -343,6 +363,14 @@ fn parse(text: &str, hash: u64) -> Doc {
             Event::InlineMath(_) => {
                 doc.inline_math.insert(range.start, range.end);
             }
+            Event::Code(_) => {
+                let slice = &text[range.clone()];
+                let ticks = slice.bytes().take_while(|&b| b == b'`').count();
+                let end_ticks = slice.bytes().rev().take_while(|&b| b == b'`').count();
+                if ticks > 0 && end_ticks >= ticks && range.start + ticks < range.end - ticks {
+                    doc.inline_codes.push((range.start + ticks)..(range.end - ticks));
+                }
+            }
             Event::Start(Tag::BlockQuote(kind)) => {
                 let alert = kind.map(|k| match k {
                     BlockQuoteKind::Note => Alert::Note,
@@ -409,7 +437,60 @@ fn parse(text: &str, hash: u64) -> Doc {
     }
 
     doc.rich.sort_by_key(|b| b.range.start);
+    doc.inline_codes.sort_by_key(|r| r.start);
+    scan_details(text, &mut doc);
     doc
+}
+
+fn scan_details(text: &str, doc: &mut Doc) {
+    let mut stack: Vec<(usize, Option<usize>, Option<usize>)> = Vec::new();
+    let mut pos = 0;
+    while pos <= text.len() {
+        let line_end = text[pos..].find('\n').map_or(text.len(), |i| pos + i);
+        let next_pos = if line_end < text.len() { line_end + 1 } else { text.len() + 1 };
+        let in_code = doc.code_at(pos).is_some();
+        let in_fm = doc.frontmatter.as_ref().is_some_and(|fm| fm.start <= pos && pos <= fm.end);
+        if !in_code && !in_fm {
+            let trimmed = text[pos..line_end].trim();
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.starts_with("<details") && (lower.len() == 8 || matches!(lower.as_bytes()[8], b'>' | b' ' | b'\t')) {
+                let sum = if lower.contains("<summary") { Some(pos) } else { None };
+                let body = if lower.contains("</summary>") && next_pos <= text.len() {
+                    Some(next_pos)
+                } else if sum.is_none() && !lower.contains("<summary") {
+                    None
+                } else {
+                    None
+                };
+                stack.push((pos, sum, body));
+            } else if lower.starts_with("</details>") {
+                if let Some((start, summary_line, body_start)) = stack.pop() {
+                    if let Some(bs) = body_start {
+                        if bs <= pos {
+                            doc.details.push(DetailsBlock {
+                                start,
+                                summary_line: summary_line.unwrap_or(start),
+                                body_start: bs,
+                                end: line_end,
+                            });
+                        }
+                    }
+                }
+            } else if let Some((_, sum, body)) = stack.last_mut() {
+                if sum.is_none() && lower.contains("<summary") {
+                    *sum = Some(pos);
+                }
+                if body.is_none() && lower.contains("</summary>") && next_pos <= text.len() {
+                    *body = Some(next_pos);
+                }
+            }
+        }
+        if line_end >= text.len() {
+            break;
+        }
+        pos = next_pos;
+    }
+    doc.details.sort_by_key(|d| d.start);
 }
 
 fn trim_range(text: &str, r: Range<usize>) -> Range<usize> {

@@ -13,7 +13,8 @@ mod visual;
 
 use std::ops::Range;
 
-pub use layout::live_layouter;
+pub use doc::doc_for;
+pub use layout::{live_layouter, toggle_details};
 pub use overlay::paint as paint_overlay;
 pub use svg_loader::SvgByContentLoader;
 pub use visual::Env;
@@ -26,6 +27,8 @@ pub enum PreviewAction {
     OpenUrl(String),
     /// Flip the task checkbox whose `[ ]` / `[x]` marker sits at this byte range.
     ToggleTask(Range<usize>),
+    /// Toggle a `<details>` block starting at this byte offset.
+    ToggleDetails(usize),
     /// Move the cursor to this byte offset (a `[x](#heading)` link).
     Jump(usize),
     /// Replace this byte range of the note with new text (table cell edits).
@@ -33,15 +36,18 @@ pub enum PreviewAction {
 }
 
 /// Works out what a click at byte offset `pos` should do.
-/// Links open with Cmd+click (a plain click just places the cursor); checkboxes toggle on a plain click.
+/// Links open with Cmd+click (a plain click just places the cursor); checkboxes and `<summary>` toggle on a plain click.
 pub fn click_action(text: &str, pos: usize, command: bool) -> Option<PreviewAction> {
     let d = doc::doc_for(text);
     if !command {
-        return d
-            .tasks
-            .iter()
-            .find(|(r, _)| r.start <= pos && pos <= r.end)
-            .map(|(r, _)| PreviewAction::ToggleTask(r.clone()));
+        if let Some((r, _)) = d.tasks.iter().find(|(r, _)| r.start <= pos && pos <= r.end) {
+            return Some(PreviewAction::ToggleTask(r.clone()));
+        }
+        let line_start = text[..pos.min(text.len())].rfind('\n').map_or(0, |i| i + 1);
+        if let Some(db) = d.details_summary_at(line_start) {
+            return Some(PreviewAction::ToggleDetails(db.start));
+        }
+        return None;
     }
 
     let line_start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
@@ -58,7 +64,6 @@ pub fn click_action(text: &str, pos: usize, command: bool) -> Option<PreviewActi
         if open <= col && col <= close + 2 {
             let inner = &line[open + 2..close];
             let target = inner.split('|').next().unwrap_or(inner).trim();
-            let target = target.split('#').next().unwrap_or(target);
             return (!target.is_empty()).then(|| PreviewAction::OpenNote(target.to_string()));
         }
         search = close + 2;
@@ -316,6 +321,26 @@ Term
         let anchor = t.find("[h]").unwrap();
         assert!(matches!(click_action(t, anchor, true), Some(PreviewAction::Jump(_))));
         assert!(click_action(t, wiki, false).is_none());
+    }
+
+    #[test]
+    fn bold_italic_hides_all_delimiters() {
+        let ctx = egui::Context::default();
+        let env = Env::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for text in ["***both***", "___both___"] {
+                    let g = live_layouter(ui, text, 500.0, None, &env);
+                    assert_eq!(g.job.text, text);
+                    // Opening delimiter, styled body, closing delimiter.
+                    assert_eq!(g.job.sections.len(), 3, "text={text}");
+                    assert_eq!(g.job.sections[0].format.color, egui::Color32::TRANSPARENT);
+                    assert!(g.job.sections[1].format.italics, "body must be italic for {text}");
+                    assert_eq!(g.job.sections[1].format.color, egui::Color32::WHITE);
+                    assert_eq!(g.job.sections[2].format.color, egui::Color32::TRANSPARENT);
+                }
+            });
+        });
     }
 }
 

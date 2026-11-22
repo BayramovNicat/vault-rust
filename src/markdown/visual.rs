@@ -2,7 +2,7 @@
 //! image URIs for pictures, and colors for highlighted code.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -39,8 +39,11 @@ pub struct SvgVisual {
 /// Vault root, file name (lowercase) -> path, and when it was built.
 type FileIndex = (PathBuf, HashMap<String, PathBuf>, Instant);
 
+const MAX_SVGS: usize = 256;
+
 thread_local! {
-    static SVGS: RefCell<HashMap<u64, Result<SvgVisual, String>>> = RefCell::new(HashMap::new());
+    static SVGS: RefCell<(HashMap<u64, Result<SvgVisual, String>>, VecDeque<u64>)> =
+        RefCell::new((HashMap::new(), VecDeque::new()));
     /// File name (lowercase) -> path, for the whole vault, and when it was built.
     static FILE_INDEX: RefCell<Option<FileIndex>> = const { RefCell::new(None) };
     /// (note folder, image src) -> resolved URI, and when it was resolved.
@@ -94,7 +97,7 @@ fn normalize_svg(svg: &str, scale: f32) -> Option<(String, Vec2)> {
 
 fn svg_visual(ctx: &Context, kind: &str, key: &str, scale: f32, render: impl FnOnce() -> Result<String, String>) -> Result<SvgVisual, String> {
     let h = hash_parts(&[kind, key]);
-    if let Some(v) = SVGS.with(|s| s.borrow().get(&h).cloned()) {
+    if let Some(v) = SVGS.with(|s| s.borrow().0.get(&h).cloned()) {
         return v;
     }
     let result = render().and_then(|svg| {
@@ -103,7 +106,17 @@ fn svg_visual(ctx: &Context, kind: &str, key: &str, scale: f32, render: impl FnO
         ctx.include_bytes(uri.clone(), svg.into_bytes());
         Ok(SvgVisual { uri, size })
     });
-    SVGS.with(|s| s.borrow_mut().insert(h, result.clone()));
+    SVGS.with(|s| {
+        let mut s = s.borrow_mut();
+        while s.0.len() >= MAX_SVGS {
+            let Some(oldest) = s.1.pop_front() else { break };
+            if let Some(Ok(old)) = s.0.remove(&oldest) {
+                ctx.forget_image(&old.uri);
+            }
+        }
+        s.0.insert(h, result.clone());
+        s.1.push_back(h);
+    });
     result
 }
 
@@ -268,12 +281,50 @@ thread_local! {
     static HIGHLIGHTS: RefCell<HashMap<u64, Highlight>> = RefCell::new(HashMap::new());
 }
 
+const ANTIGRAVITY_TMTHEME: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>name</key><string>Antigravity Dark</string>
+<key>settings</key><array>
+<dict><key>settings</key><dict>
+  <key>background</key><string>#1c1c1d</string>
+  <key>foreground</key><string>#d6d6da</string>
+</dict></dict>
+<dict><key>scope</key><string>comment, punctuation.definition.comment</string><key>settings</key><dict>
+  <key>foreground</key><string>#6e7078</string><key>fontStyle</key><string>italic</string>
+</dict></dict>
+<dict><key>scope</key><string>string, constant.other.symbol</string><key>settings</key><dict>
+  <key>foreground</key><string>#a2dd2e</string>
+</dict></dict>
+<dict><key>scope</key><string>constant.numeric, constant.language, constant.character</string><key>settings</key><dict>
+  <key>foreground</key><string>#78b4fa</string>
+</dict></dict>
+<dict><key>scope</key><string>keyword, storage, storage.type, support.macro</string><key>settings</key><dict>
+  <key>foreground</key><string>#e4a055</string>
+</dict></dict>
+<dict><key>scope</key><string>entity.name.function, support.function, variable.function</string><key>settings</key><dict>
+  <key>foreground</key><string>#e5c878</string>
+</dict></dict>
+<dict><key>scope</key><string>entity.name.type, entity.name.class, entity.name.struct, support.type, support.class</string><key>settings</key><dict>
+  <key>foreground</key><string>#78b4fa</string>
+</dict></dict>
+<dict><key>scope</key><string>variable.parameter, variable.other</string><key>settings</key><dict>
+  <key>foreground</key><string>#d6d6da</string>
+</dict></dict>
+</array>
+</dict></plist>"##;
+
 fn syntect_assets() -> &'static (syntect::parsing::SyntaxSet, syntect::highlighting::Theme) {
     static ASSETS: OnceLock<(syntect::parsing::SyntaxSet, syntect::highlighting::Theme)> = OnceLock::new();
     ASSETS.get_or_init(|| {
         let ss = syntect::parsing::SyntaxSet::load_defaults_newlines();
-        let mut themes = syntect::highlighting::ThemeSet::load_defaults();
-        let theme = themes.themes.remove("base16-ocean.dark").unwrap_or_default();
+        let mut cur = std::io::Cursor::new(ANTIGRAVITY_TMTHEME.as_bytes());
+        let theme = syntect::highlighting::ThemeSet::load_from_reader(&mut cur).unwrap_or_else(|_| {
+            syntect::highlighting::ThemeSet::load_defaults()
+                .themes
+                .remove("base16-ocean.dark")
+                .unwrap_or_default()
+        });
         (ss, theme)
     })
 }
